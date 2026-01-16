@@ -1,0 +1,122 @@
+{
+    "latency_metrics": {
+        "translate": {
+            "p50": 110.17489433288574,
+            "p95": 232.0,
+            "p99": 350.4798412322998,
+            "min": 0.286102294921875,
+            "max": 358.0,
+            "mean": 108.3271029472351,
+            "count": 140
+        },
+        "segment_total": {
+            "p50": 487.0,
+            "p95": 713.0,
+            "p99": 1170.0,
+            "min": 336.0,
+            "max": 1170.0,
+            "mean": 514.7714285714286,
+            "count": 70
+        },
+        "tts": {
+            "p50": 87.5,
+            "p95": 135.0,
+            "p99": 348.0,
+            "min": 45.0,
+            "max": 348.0,
+            "mean": 92.88571428571429,
+            "count": 70
+        },
+        "asr": {
+            "p50": 271.0,
+            "p95": 501.0,
+            "p99": 801.0,
+            "min": 238.0,
+            "max": 801.0,
+            "mean": 299.07142857142856,
+            "count": 70
+        }
+    },
+    "cache_stats": {
+        "translate": {
+            "hits": 20,
+            "misses": 120,
+            "total": 140,
+            "hit_rate": 0.14285714285714285,
+            "miss_rate": 0.8571428571428571,
+            "cache_hit_latency": {
+                "p50": 2.0,
+                "p95": 6.0,
+                "p99": 6.0,
+                "min": 0.286102294921875,
+                "max": 6.0,
+                "mean": 2.138932228088379,
+                "count": 20
+            },
+            "cache_miss_latency": {
+                "p50": 115.0,
+                "p95": 252.75588035583496,
+                "p99": 350.4798412322998,
+                "min": 72.57437705993652,
+                "max": 358.0,
+                "mean": 126.02513140042623,
+                "count": 120
+            }
+        }
+    },
+    "cache_improvement": {
+        "hit_rate": 0.14285714285714285,
+        "cache_hit_p50_ms": 2.0,
+        "cache_miss_p50_ms": 115.0,
+        "avg_latency_with_cache_ms": 98.86,
+        "avg_latency_without_cache_ms": 115.0,
+        "improvement_factor": 1.16,
+        "improvement_percent": 14.0,
+        "cache_hit_latency": {
+            "p50": 2.0,
+            "p95": 6.0,
+            "p99": 6.0,
+            "min": 0.286102294921875,
+            "max": 6.0,
+            "mean": 2.138932228088379,
+            "count": 20
+        },
+        "cache_miss_latency": {
+            "p50": 115.0,
+            "p95": 252.75588035583496,
+            "p99": 350.4798412322998,
+            "min": 72.57437705993652,
+            "max": 358.0,
+            "mean": 126.02513140042623,
+            "count": 120
+        }
+    },
+    "job_timing_metrics": {
+        "end_to_end": {
+            "p50": 7557.0,
+            "p95": 9738.0,
+            "p99": 9738.0,
+            "min": 5575.0,
+            "max": 9738.0,
+            "mean": 7581.2,
+            "count": 5
+        },
+        "time_to_first_segment": {
+            "p50": 592.0,
+            "p95": 1532.0,
+            "p99": 1532.0,
+            "min": 556.0,
+            "max": 1532.0,
+            "mean": 798.2,
+            "count": 5
+        }
+    },
+    "incremental_improvement": {
+        "time_to_first_segment_p95_ms": 1532.0,
+        "end_to_end_p95_ms": 9738.0,
+        "improvement_percent": 84.3,
+        "improvement_factor": 6.36,
+        "time_saved_ms": 8206.0
+    },
+    "timestamp": "2026-01-16T11:36:21.864621"
+}

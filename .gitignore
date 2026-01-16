@@ -1,0 +1,40 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Data/artifacts
+data/outputs/
+data/uploads/
+test_output/
+voiceSamples/
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+
+# Models
+models/
+*.pt
+*.safetensors

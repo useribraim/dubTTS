@@ -1,0 +1,139 @@
+{
+  "id": null,
+  "uid": "dub-mvp-overview",
+  "title": "Dub MVP Overview",
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "5s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Queue Depth",
+      "id": 1,
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 3 },
+      "targets": [
+        { "expr": "dub_queue_depth", "legendFormat": "queue" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Active Jobs",
+      "id": 2,
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 3 },
+      "targets": [
+        { "expr": "dub_active_jobs", "legendFormat": "active" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Retries Total",
+      "id": 3,
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 3 },
+      "targets": [
+        { "expr": "dub_job_retries_total", "legendFormat": "retries" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Failures Total",
+      "id": 4,
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 3 },
+      "targets": [
+        { "expr": "dub_job_failures_total", "legendFormat": "failures" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Time to First Segment (p95)",
+      "id": 5,
+      "gridPos": { "x": 0, "y": 3, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(dub_time_to_first_segment_ms_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "End-to-End Job Latency (p95)",
+      "id": 6,
+      "gridPos": { "x": 12, "y": 3, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(dub_job_latency_ms_bucket[5m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Stage Latency p95 (ms)",
+      "id": 7,
+      "gridPos": { "x": 0, "y": 9, "w": 24, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(dub_stage_latency_ms_bucket[5m])) by (le, stage))",
+          "legendFormat": "{{stage}} p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Translate Cache Hit Rate",
+      "id": 8,
+      "gridPos": { "x": 0, "y": 17, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "rate(dub_cache_hits_total{operation=\"translate\"}[5m]) / (rate(dub_cache_hits_total{operation=\"translate\"}[5m]) + rate(dub_cache_misses_total{operation=\"translate\"}[5m]))",
+          "legendFormat": "hit_rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Translate Cache Hit/Miss Rate",
+      "id": 9,
+      "gridPos": { "x": 12, "y": 17, "w": 12, "h": 6 },
+      "targets": [
+        {
+          "expr": "rate(dub_cache_hits_total{operation=\"translate\"}[5m])",
+          "legendFormat": "hits/s"
+        },
+        {
+          "expr": "rate(dub_cache_misses_total{operation=\"translate\"}[5m])",
+          "legendFormat": "misses/s"
+        }
+      ]
+    }
+  ],
+  "templating": { "list": [] },
+  "annotations": { "list": [] }
+}
