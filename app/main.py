@@ -22,6 +22,7 @@ from app.redis_backend import (
 )
 from app.streaming import (
     CHUNK_STREAM_MAXLEN,
+    DLQ_STREAM_KEY,
     StreamSessionStore,
     chunks_stream_key,
 )
@@ -497,3 +498,21 @@ async def get_stream_segment(session_id: str, segment_index: int):
     except KeyError:
         raise HTTPException(status_code=404, detail="segment not found")
     return FileResponse(path, media_type="audio/wav", filename=os.path.basename(path))
+
+
+@app.get("/v1/dlq")
+async def get_dead_letters(count: int = 50):
+    """Inspect the segment dead-letter stream (tasks that exhausted retries)."""
+    r, _store, _bus, _ss = get_clients()
+    count = max(1, min(count, 500))
+    entries = await r.xrange(DLQ_STREAM_KEY, min="-", max="+", count=count)
+    items = []
+    for entry_id, fields in entries:
+        item = {
+            (k.decode() if isinstance(k, (bytes, bytearray)) else k):
+            (v.decode() if isinstance(v, (bytes, bytearray)) else v)
+            for k, v in fields.items()
+        }
+        item["stream_entry_id"] = entry_id.decode() if isinstance(entry_id, (bytes, bytearray)) else str(entry_id)
+        items.append(item)
+    return {"count": len(items), "dead_letters": items}

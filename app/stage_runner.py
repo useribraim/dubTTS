@@ -28,11 +28,16 @@ from app.logging_config import setup_logging, get_logger
 from app.metrics import (
     increment_failure,
     increment_retry,
+    record_dlq,
     record_job_timing,
     record_latency,
+    record_stage_recovered,
+    record_stage_retry,
+    record_stage_success,
 )
 from app.redis_backend import REDIS_URL, RedisEventBus, RedisJobStore
 from app.streaming import (
+    DLQ_STREAM_KEY,
     SEG_GROUPS,
     SEG_MAX_ATTEMPTS,
     SEG_STREAM_MAXLEN,
@@ -45,6 +50,10 @@ setup_logging(level=os.getenv("LOG_LEVEL", "INFO"), json_output=os.getenv("LOG_J
 logger = get_logger(__name__)
 
 STREAMS_ROOT = os.getenv("STREAMS_DIR", os.path.join(os.path.dirname(__file__), "..", "data", "streams"))
+
+# Idle time after which an un-acked pending entry is reclaimed by another
+# consumer (crash recovery for workers that die mid-processing).
+CLAIM_IDLE_MS = int(os.getenv("SEG_CLAIM_IDLE_MS", "60000"))
 
 
 def _consumer_name(stage: str) -> str:
@@ -77,6 +86,28 @@ async def _ensure_group(r: redis.Redis, stream: str, group: str) -> None:
     except ResponseError as e:
         if "BUSYGROUP" not in str(e):
             raise
+
+
+async def _claim_stale(r: redis.Redis, stream: str, group: str, consumer: str):
+    """
+    Reclaim one pending entry idle longer than CLAIM_IDLE_MS (left behind by
+    a crashed worker). Returns (entry_id, fields) or None.
+    """
+    try:
+        result = await r.xautoclaim(
+            stream,
+            group,
+            consumer,
+            min_idle_time=CLAIM_IDLE_MS,
+            start_id="0-0",
+            count=1,
+        )
+        entries = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else []
+        if entries:
+            return entries[0]
+    except Exception:
+        pass
+    return None
 
 
 async def maybe_complete_session(r: redis.Redis, session_id: str, bus: RedisEventBus) -> bool:
@@ -317,17 +348,22 @@ async def run_stage_loop(
     )
 
     while stop_event is None or not stop_event.is_set():
-        try:
-            messages = await r.xreadgroup(group, consumer, streams={stream: ">"}, count=1, block=2000)
-        except Exception as e:
-            logger.error("Stage read failed", extra={"stage": stage, "error": str(e)}, exc_info=True)
-            await asyncio.sleep(1)
-            continue
-        if not messages:
-            continue
+        # Reclaim work left pending by crashed workers first, then new work.
+        entry = await _claim_stale(r, stream, group, consumer)
+        reclaimed = entry is not None
+        if entry is None:
+            try:
+                messages = await r.xreadgroup(group, consumer, streams={stream: ">"}, count=1, block=2000)
+            except Exception as e:
+                logger.error("Stage read failed", extra={"stage": stage, "error": str(e)}, exc_info=True)
+                await asyncio.sleep(1)
+                continue
+            if not messages:
+                continue
+            _s, entries = messages[0]
+            entry = entries[0]
 
-        _s, entries = messages[0]
-        entry_id, fields = entries[0]
+        entry_id, fields = entry
         env = decode_envelope(fields)
         segment_id = env.get("segment_id", "?")
         attempts = int(env.get("attempts", "0") or 0)
@@ -341,8 +377,30 @@ async def run_stage_loop(
 
         logger.info(
             "Stage task claimed",
-            extra={"stage": stage, "segment_id": segment_id, "attempts": attempts, "operation": "stage_claim"},
+            extra={
+                "stage": stage,
+                "segment_id": segment_id,
+                "attempts": attempts,
+                "reclaimed": reclaimed,
+                "operation": "stage_claim",
+            },
         )
+
+        # Zero re-execution for segments that already completed the whole
+        # pipeline (e.g. duplicated by a crashed upstream worker).
+        if stage in ("asr", "mt"):
+            try:
+                job_id = env["job_id"]
+                idx = int(env["segment_index"])
+                if await is_segment_done(ctx, job_id, idx, tts_out_path(job_id, idx)):
+                    logger.info(
+                        "Segment already complete upstream, skipping",
+                        extra={"stage": stage, "segment_id": segment_id, "operation": "stage_skip_done"},
+                    )
+                    await r.xack(stream, group, entry_id)
+                    continue
+            except Exception:
+                pass  # dedup check failure must not block processing
 
         try:
             updates = await handler(ctx, env)
@@ -354,6 +412,16 @@ async def run_stage_loop(
             )
             if attempts + 1 >= SEG_MAX_ATTEMPTS:
                 increment_failure()
+                await record_dlq(stage)
+                try:
+                    await r.xadd(
+                        DLQ_STREAM_KEY,
+                        {"stage": stage, "error": str(e)[:500], "failed_at": f"{time.time():.3f}", **env},
+                        maxlen=SEG_STREAM_MAXLEN,
+                        approximate=True,
+                    )
+                except Exception:
+                    pass
                 await ctx.bus.publish(
                     env.get("job_id", ""),
                     "segment_failed",
@@ -362,11 +430,16 @@ async def run_stage_loop(
                 await r.xack(stream, group, entry_id)
             else:
                 increment_retry()
+                await record_stage_retry(stage)
                 env["attempts"] = str(attempts + 1)
                 env["enqueue_ts"] = f"{time.time():.3f}"
                 await r.xadd(stream, env, maxlen=SEG_STREAM_MAXLEN, approximate=True)
                 await r.xack(stream, group, entry_id)
             continue
+
+        await record_stage_success(stage)
+        if attempts > 0:
+            await record_stage_recovered(stage)
 
         next_stage = NEXT_STAGE[stage]
         if next_stage is not None:

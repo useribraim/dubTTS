@@ -48,6 +48,18 @@ FAILURE_COUNTER = Counter("dub_job_failures_total", "Total job failures")
 CACHE_HIT_COUNTER = Counter("dub_cache_hits_total", "Cache hits", ["operation"])
 CACHE_MISS_COUNTER = Counter("dub_cache_misses_total", "Cache misses", ["operation"])
 
+# Stage-level reliability counters (streaming pipeline)
+STAGE_RETRY_COUNTER = Counter("dub_stage_retries_total", "Stage executions retried after failure", ["stage"])
+STAGE_RECOVERED_COUNTER = Counter("dub_stage_recovered_total", "Tasks that succeeded after at least one retry", ["stage"])
+STAGE_SUCCESS_COUNTER = Counter("dub_stage_success_total", "Successful stage executions", ["stage"])
+DLQ_COUNTER = Counter("dub_dlq_total", "Tasks dead-lettered after exhausting retries", ["stage"])
+
+# Redis keys for cross-process reliability reporting
+RETRY_PREFIX = f"{METRICS_PREFIX}retry:"
+RECOVERED_PREFIX = f"{METRICS_PREFIX}recovered:"
+SUCCESS_PREFIX = f"{METRICS_PREFIX}success:"
+DLQ_PREFIX = f"{METRICS_PREFIX}dlq:"
+
 
 def _get_metrics_redis() -> redis.Redis:
     """Get or create the metrics Redis connection for the running loop."""
@@ -315,6 +327,79 @@ def increment_failure() -> None:
         pass
 
 
+async def _record_counter(prefix: str, stage: str, prom_counter) -> None:
+    """Bump a reliability counter in Redis (cross-process) and Prometheus."""
+    try:
+        r = _get_metrics_redis()
+        key = f"{prefix}{stage}"
+        await r.incr(key)
+        await r.expire(key, 30 * 24 * 3600)
+    except Exception:
+        pass
+    try:
+        prom_counter.labels(stage=stage).inc()
+    except Exception:
+        pass
+
+
+async def record_stage_retry(stage: str) -> None:
+    """A stage execution failed and is being retried."""
+    await _record_counter(RETRY_PREFIX, stage, STAGE_RETRY_COUNTER)
+
+
+async def record_stage_recovered(stage: str) -> None:
+    """A task succeeded after at least one retry."""
+    await _record_counter(RECOVERED_PREFIX, stage, STAGE_RECOVERED_COUNTER)
+
+
+async def record_stage_success(stage: str) -> None:
+    """A stage execution succeeded."""
+    await _record_counter(SUCCESS_PREFIX, stage, STAGE_SUCCESS_COUNTER)
+
+
+async def record_dlq(stage: str) -> None:
+    """A task exhausted retries and was dead-lettered."""
+    await _record_counter(DLQ_PREFIX, stage, DLQ_COUNTER)
+
+
+async def _read_counter(r: redis.Redis, prefix: str, stage: str) -> int:
+    try:
+        val = await r.get(f"{prefix}{stage}")
+        return int(val) if val else 0
+    except Exception:
+        return 0
+
+
+async def get_reliability_stats(stages=("asr", "mt", "tts")) -> Dict[str, Dict[str, float]]:
+    """
+    Reliability summary per stage: bounded-retry recovery and dead-letter rates.
+
+    recovery_rate = recovered / (recovered + dead_lettered)   # failed tasks rescued
+    dlq_rate      = dead_lettered / (successes + dead_lettered)
+    """
+    try:
+        r = _get_metrics_redis()
+    except Exception:
+        return {}
+    stats: Dict[str, Dict[str, float]] = {}
+    for stage in stages:
+        retries = await _read_counter(r, RETRY_PREFIX, stage)
+        recovered = await _read_counter(r, RECOVERED_PREFIX, stage)
+        successes = await _read_counter(r, SUCCESS_PREFIX, stage)
+        dead = await _read_counter(r, DLQ_PREFIX, stage)
+        failed_tasks = recovered + dead
+        stats[stage] = {
+            "retries": retries,
+            "recovered": recovered,
+            "successes": successes,
+            "dead_lettered": dead,
+            "failed_tasks": failed_tasks,
+            "recovery_rate": round(recovered / failed_tasks, 4) if failed_tasks else None,
+            "dlq_rate": round(dead / (successes + dead), 4) if (successes + dead) else None,
+        }
+    return stats
+
+
 def get_prometheus_metrics() -> bytes:
     return generate_latest()
 
@@ -350,6 +435,7 @@ async def get_performance_report() -> Dict:
     latency_metrics = await get_latency_metrics()
     cache_stats = await get_cache_stats()
     job_timing_metrics = await get_job_timing_metrics()
+    reliability_stats = await get_reliability_stats()
     
     # Calculate cache improvement using ACTUAL measured latencies
     cache_improvement = {}
@@ -426,5 +512,6 @@ async def get_performance_report() -> Dict:
         "cache_improvement": cache_improvement,
         "job_timing_metrics": job_timing_metrics,
         "incremental_improvement": incremental_improvement,
+        "reliability": reliability_stats,
         "timestamp": datetime.utcnow().isoformat(),
     }
