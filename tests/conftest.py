@@ -4,6 +4,7 @@ Pytest configuration and shared fixtures.
 
 import os
 import pytest
+import pytest_asyncio
 import tempfile
 import shutil
 from pathlib import Path
@@ -24,7 +25,7 @@ from app.redis_backend import RedisJobStore, RedisEventBus
 pytest_plugins = ('pytest_asyncio',)
 
 
-@pytest.fixture(scope="function")
+@pytest_asyncio.fixture(scope="function")
 async def redis_client() -> AsyncGenerator[redis.Redis, None]:
     """Create a Redis client for testing."""
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/1")
@@ -46,13 +47,13 @@ async def redis_client() -> AsyncGenerator[redis.Redis, None]:
         pytest.skip(f"Redis not available: {e}")
 
 
-@pytest.fixture(scope="function")
+@pytest_asyncio.fixture(scope="function")
 async def job_store(redis_client: redis.Redis) -> RedisJobStore:
     """Create a RedisJobStore instance for testing."""
     return RedisJobStore(redis_client)
 
 
-@pytest.fixture(scope="function")
+@pytest_asyncio.fixture(scope="function")
 async def event_bus(redis_client: redis.Redis) -> RedisEventBus:
     """Create a RedisEventBus instance for testing."""
     return RedisEventBus(redis_client)

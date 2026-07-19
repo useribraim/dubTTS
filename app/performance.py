@@ -48,6 +48,8 @@ async def get_cached_translation(src_text: str, src_lang: str, tgt_lang: str) ->
         key = _cache_key(src_text, src_lang, tgt_lang)
         cached = await r.get(key)
         if cached:
+            if isinstance(cached, (bytes, bytearray)):
+                return cached.decode("utf-8")
             return cached
     except Exception:
         # Cache miss or error - continue without cache

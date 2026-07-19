@@ -45,15 +45,12 @@ flowchart LR
 - Docker, if you want to run Redis, Prometheus, or Grafana in containers
 - AWS credentials for real translation and Polly synthesis
 
-The project does not currently include a pinned dependency file. Install the runtime packages manually or create your own `requirements.txt` from the imports:
+Create a virtual environment and install the pinned local dependencies:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install \
-  fastapi uvicorn python-multipart aiofiles redis prometheus-client \
-  boto3 botocore faster-whisper webrtcvad requests \
-  pytest pytest-asyncio httpx
+pip install -r requirements.txt
 ```
 
 Install FFmpeg separately:
@@ -72,7 +69,7 @@ sudo apt-get install -y ffmpeg
 Start Redis:
 
 ```bash
-docker run --rm -p 6379:6379 redis:7-alpine
+docker compose up -d redis
 ```
 
 Start the API:
@@ -226,7 +223,7 @@ See [OBSERVABILITY.md](OBSERVABILITY.md), [PERFORMANCE_METRICS.md](PERFORMANCE_M
 Start Redis first:
 
 ```bash
-docker run --rm -p 6379:6379 redis:7-alpine
+docker compose up -d redis
 ```
 
 Run the test suite:
@@ -273,5 +270,4 @@ data/                  Runtime uploads and generated outputs
 - The first Faster-Whisper run downloads and loads a model, which can take time.
 - Real dubbing quality depends on AWS credentials, selected Polly voice, source audio quality, and target language.
 - `USE_AWS=0` is a pipeline test mode, not a real dubbing mode.
-- There is no pinned dependency manifest yet. Add one before deploying or sharing reproducible environments.
-
+- See [CLAIM_ALIGNMENT.md](CLAIM_ALIGNMENT.md) for the resume-safe wording of what this repository demonstrates.
