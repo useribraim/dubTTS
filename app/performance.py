@@ -13,8 +13,8 @@ import redis.asyncio as redis
 
 from app.redis_backend import REDIS_URL
 
-# Redis connection for cache (separate from main Redis)
-_cache_redis: Optional[redis.Redis] = None
+# Redis connection for cache, one per event loop (clients are loop-bound)
+_cache_redis: dict = {}
 
 # Cache TTL (24 hours)
 CACHE_TTL = 86400
@@ -24,11 +24,18 @@ CACHE_PREFIX = "dub:cache:translate:"
 
 
 def _get_cache_redis() -> redis.Redis:
-    """Get or create cache Redis connection."""
-    global _cache_redis
-    if _cache_redis is None:
-        _cache_redis = redis.from_url(REDIS_URL, decode_responses=True)
-    return _cache_redis
+    """Get or create the cache Redis connection for the running loop."""
+    if isinstance(_cache_redis, redis.Redis):
+        return _cache_redis  # direct override (tests)
+    try:
+        loop_id = id(__import__("asyncio").get_running_loop())
+    except RuntimeError:
+        loop_id = 0
+    client = _cache_redis.get(loop_id)
+    if client is None:
+        client = redis.from_url(REDIS_URL, decode_responses=True)
+        _cache_redis[loop_id] = client
+    return client
 
 
 def _cache_key(src_text: str, src_lang: str, tgt_lang: str) -> str:

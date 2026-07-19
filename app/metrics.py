@@ -13,8 +13,8 @@ from prometheus_client import Counter, Gauge, Histogram, generate_latest
 
 from app.redis_backend import REDIS_URL
 
-# Redis connection for metrics
-_metrics_redis: Optional[redis.Redis] = None
+# Redis connection for metrics, one per event loop (clients are loop-bound)
+_metrics_redis: Dict[int, redis.Redis] = {}
 
 # Metric key prefixes
 METRICS_PREFIX = "dub:metrics:"
@@ -50,11 +50,16 @@ CACHE_MISS_COUNTER = Counter("dub_cache_misses_total", "Cache misses", ["operati
 
 
 def _get_metrics_redis() -> redis.Redis:
-    """Get or create metrics Redis connection."""
-    global _metrics_redis
-    if _metrics_redis is None:
-        _metrics_redis = redis.from_url(REDIS_URL, decode_responses=True)
-    return _metrics_redis
+    """Get or create the metrics Redis connection for the running loop."""
+    try:
+        loop_id = id(__import__("asyncio").get_running_loop())
+    except RuntimeError:
+        loop_id = 0
+    client = _metrics_redis.get(loop_id)
+    if client is None:
+        client = redis.from_url(REDIS_URL, decode_responses=True)
+        _metrics_redis[loop_id] = client
+    return client
 
 
 async def record_latency(operation: str, latency_ms: float) -> None:

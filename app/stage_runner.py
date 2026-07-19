@@ -58,6 +58,19 @@ def done_set_key(session_id: str) -> str:
     return f"dub:stream:{session_id}:done_set"
 
 
+def tts_out_path(job_id: str, idx: int) -> str:
+    return os.path.join(STREAMS_ROOT, job_id, "segments_out", f"dub_{idx:04d}.wav")
+
+
+async def is_segment_done(ctx: "StageContext", job_id: str, idx: int, tts_path: str) -> bool:
+    """True if the segment's audio was already produced and recorded."""
+    return bool(
+        await ctx.r.sismember(done_set_key(job_id), idx)
+        and await ctx.store.get_segment_meta(job_id, idx) is not None
+        and os.path.exists(tts_path)
+    )
+
+
 async def _ensure_group(r: redis.Redis, stream: str, group: str) -> None:
     try:
         await r.xgroup_create(stream, group, id="0-0", mkstream=True)
@@ -159,40 +172,23 @@ async def _handle_mt(ctx: "StageContext", env: Dict[str, str]) -> Dict[str, str]
     return {"tgt_text": tgt_text, "mt_ms": str(mt_ms)}
 
 
-async def _handle_tts(ctx: "StageContext", env: Dict[str, str]) -> Dict[str, str]:
+async def finalize_tts_segment(ctx: "StageContext", env: Dict[str, str], tts_path: str, tts_ms: int) -> None:
+    """
+    Bookkeeping once segment audio exists at tts_path: idempotent state
+    updates, replayable events, and session-completion check. Shared by the
+    in-process stage runner and the gRPC dispatcher.
+    """
     job_id = env["job_id"]
     idx = int(env["segment_index"])
-    out_dir = os.path.join(STREAMS_ROOT, job_id, "segments_out")
-    tts_path = os.path.join(out_dir, f"dub_{idx:04d}.wav")
 
-    already_done = await ctx.r.sismember(done_set_key(job_id), idx)
-    existing_meta = await ctx.store.get_segment_meta(job_id, idx)
-
-    if already_done and existing_meta and os.path.exists(tts_path):
-        # Duplicate delivery of a completed segment: replay event, no re-synthesis.
+    if await is_segment_done(ctx, job_id, idx, tts_path):
+        existing_meta = await ctx.store.get_segment_meta(job_id, idx)
         await ctx.bus.publish(job_id, "segment", existing_meta)
         logger.info(
             "Segment already synthesized, replayed from state",
             extra={"job_id": job_id, "segment_id": env["segment_id"], "operation": "stage_tts_replay"},
         )
-        return {}
-
-    t0 = time.time()
-    tts_provider = os.getenv("TTS_PROVIDER", "aws")
-    os.makedirs(out_dir, exist_ok=True)
-    try:
-        from app.tts_providers import tts_with_provider
-
-        await asyncio.to_thread(tts_with_provider, env.get("tgt_text", ""), env.get("voice", "Tatyana"), tts_path, "16000", tts_provider)
-    except ImportError:
-        from app.aws_nlp import tts_to_wav
-
-        await asyncio.to_thread(tts_to_wav, env.get("tgt_text", ""), env.get("voice", "Tatyana"), tts_path)
-    tts_ms = int((time.time() - t0) * 1000)
-    try:
-        await record_latency("tts", tts_ms)
-    except Exception:
-        pass
+        return
 
     await ctx.store.append_segment(job_id, tts_path, idx)
     await ctx.r.sadd(done_set_key(job_id), idx)
@@ -239,6 +235,41 @@ async def _handle_tts(ctx: "StageContext", env: Dict[str, str]) -> Dict[str, str
     )
 
     await maybe_complete_session(ctx.r, job_id, ctx.bus)
+
+
+async def _handle_tts(ctx: "StageContext", env: Dict[str, str]) -> Dict[str, str]:
+    job_id = env["job_id"]
+    idx = int(env["segment_index"])
+    tts_path = tts_out_path(job_id, idx)
+
+    if await is_segment_done(ctx, job_id, idx, tts_path):
+        # Duplicate delivery of a completed segment: replay event, no re-synthesis.
+        existing_meta = await ctx.store.get_segment_meta(job_id, idx)
+        await ctx.bus.publish(job_id, "segment", existing_meta)
+        logger.info(
+            "Segment already synthesized, replayed from state",
+            extra={"job_id": job_id, "segment_id": env["segment_id"], "operation": "stage_tts_replay"},
+        )
+        return {}
+
+    t0 = time.time()
+    tts_provider = os.getenv("TTS_PROVIDER", "aws")
+    os.makedirs(os.path.dirname(tts_path), exist_ok=True)
+    try:
+        from app.tts_providers import tts_with_provider
+
+        await asyncio.to_thread(tts_with_provider, env.get("tgt_text", ""), env.get("voice", "Tatyana"), tts_path, "16000", tts_provider)
+    except ImportError:
+        from app.aws_nlp import tts_to_wav
+
+        await asyncio.to_thread(tts_to_wav, env.get("tgt_text", ""), env.get("voice", "Tatyana"), tts_path)
+    tts_ms = int((time.time() - t0) * 1000)
+    try:
+        await record_latency("tts", tts_ms)
+    except Exception:
+        pass
+
+    await finalize_tts_segment(ctx, env, tts_path, tts_ms)
     return {}
 
 
@@ -259,16 +290,25 @@ STAGE_HANDLERS: Dict[str, Callable[[StageContext, Dict[str, str]], Awaitable[Dic
 NEXT_STAGE = {"asr": "mt", "mt": "tts", "tts": None}
 
 
-async def run_stage(stage: str, stop_event: Optional[asyncio.Event] = None) -> None:
-    if stage not in STAGE_HANDLERS:
-        raise ValueError(f"unknown stage: {stage}")
-
+async def run_stage_loop(
+    stage: str,
+    handler: Callable[["StageContext", Dict[str, str]], Awaitable[Dict[str, str]]],
+    stop_event: Optional[asyncio.Event] = None,
+    ctx: Optional["StageContext"] = None,
+    consumer: Optional[str] = None,
+) -> None:
+    """
+    Core claim -> execute -> enqueue-downstream -> ack loop for one stage.
+    Shared by the in-process stage runner and the gRPC dispatcher.
+    """
     r = redis.from_url(REDIS_URL, decode_responses=False)
-    ctx = StageContext(r, stage)
+    if ctx is None:
+        ctx = StageContext(r, stage)
+    else:
+        r = ctx.r
     stream = SEG_STREAMS[stage]
     group = SEG_GROUPS[stage]
-    consumer = _consumer_name(stage)
-    handler = STAGE_HANDLERS[stage]
+    consumer = consumer or _consumer_name(stage)
     await _ensure_group(r, stream, group)
 
     logger.info(
@@ -335,6 +375,12 @@ async def run_stage(stage: str, stop_event: Optional[asyncio.Event] = None) -> N
             env["enqueue_ts"] = f"{time.time():.3f}"
             await r.xadd(SEG_STREAMS[next_stage], env, maxlen=SEG_STREAM_MAXLEN, approximate=True)
         await r.xack(stream, group, entry_id)
+
+
+async def run_stage(stage: str, stop_event: Optional[asyncio.Event] = None) -> None:
+    if stage not in STAGE_HANDLERS:
+        raise ValueError(f"unknown stage: {stage}")
+    await run_stage_loop(stage, STAGE_HANDLERS[stage], stop_event=stop_event)
 
 
 def main() -> None:

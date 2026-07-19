@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package dubtts;
+
+// Stage workers for the streaming voice-over translation pipeline.
+// Workers are stateless compute services; all coordination, ordering,
+// retries, and session state live in the Redis Streams dispatchers.
+
+service TranscriptionService {
+  // Transcribe one audio segment (16 kHz mono WAV bytes) to text.
+  rpc Transcribe(TranscribeRequest) returns (TranscribeResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+service TranslationService {
+  // Translate text between languages (server-side caching).
+  rpc Translate(TranslateRequest) returns (TranslateResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+service SynthesisService {
+  // Synthesize text to a 16 kHz mono WAV audio segment.
+  rpc Synthesize(SynthesizeRequest) returns (SynthesizeResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message TranscribeRequest {
+  bytes audio = 1;        // 16 kHz s16le mono WAV container
+  string lang = 2;        // BCP-47-ish source language hint, e.g. "en"
+  string segment_id = 3;  // traceable "{job_id}:{segment_index}"
+}
+
+message TranscribeResponse {
+  string text = 1;
+  int64 duration_ms = 2;  // server-side compute time
+}
+
+message TranslateRequest {
+  string text = 1;
+  string src_lang = 2;
+  string tgt_lang = 3;
+  string segment_id = 4;
+}
+
+message TranslateResponse {
+  string text = 1;
+  int64 duration_ms = 2;
+  bool cache_hit = 3;
+}
+
+message SynthesizeRequest {
+  string text = 1;
+  string voice = 2;
+  int32 sample_rate = 3;  // expected 16000
+  string segment_id = 4;
+}
+
+message SynthesizeResponse {
+  bytes audio = 1;        // WAV container
+  int64 duration_ms = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ok = 1;
+  string details = 2;
+}
