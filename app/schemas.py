@@ -27,3 +27,24 @@ class SegmentEvent(BaseModel):
 
 class JobDoneEvent(BaseModel):
     output_path: str
+
+
+StreamStatus = Literal["open", "running", "finalized", "done", "failed"]
+
+
+class CreateStreamResponse(BaseModel):
+    session_id: str
+
+
+class StreamStatusResponse(BaseModel):
+    session_id: str
+    status: str
+    src_lang: str
+    tgt_lang: str
+    voice: str
+    finalized: bool
+    total_segments: int
+    done_segments: int
+    created_at: float
+    updated_at: float
+    error: Optional[str] = None

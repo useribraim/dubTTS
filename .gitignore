@@ -27,6 +27,7 @@ htmlcov/
 # Data/artifacts
 data/outputs/
 data/uploads/
+data/streams/
 test_output/
 voiceSamples/
 *.wav

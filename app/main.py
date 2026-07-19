@@ -5,19 +5,25 @@ import asyncio
 import time
 import traceback
 from datetime import datetime
+from typing import Dict
 
 import aiofiles
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form, Response
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 import redis.asyncio as redis
 
-from app.schemas import CreateDubResponse, DubStatusResponse
+from app.schemas import CreateDubResponse, DubStatusResponse, CreateStreamResponse, StreamStatusResponse
 from app.redis_backend import (
     REDIS_URL,
     RedisJobStore,
     RedisEventBus,
     events_stream_key,
+)
+from app.streaming import (
+    CHUNK_STREAM_MAXLEN,
+    StreamSessionStore,
+    chunks_stream_key,
 )
 from app.logging_config import setup_logging, get_logger, set_correlation_id
 from app.metrics import get_prometheus_metrics
@@ -35,9 +41,22 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app = FastAPI(title="Dub MVP", version="1.0")
 
-r = redis.from_url(REDIS_URL, decode_responses=False)
-store = RedisJobStore(r)
-bus = RedisEventBus(r)
+# Redis clients are bound to the event loop that first uses them. To stay
+# correct with multiple loops (uvicorn loop, test portals, WS sessions),
+# keep one set of clients per running loop.
+_loop_clients: Dict[int, tuple] = {}
+
+
+def get_clients():
+    """Return (redis, job_store, event_bus, stream_store) for the running loop."""
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    entry = _loop_clients.get(key)
+    if entry is None:
+        rc = redis.from_url(REDIS_URL, decode_responses=False)
+        entry = (rc, RedisJobStore(rc), RedisEventBus(rc), StreamSessionStore(rc))
+        _loop_clients[key] = entry
+    return entry
 
 
 @app.exception_handler(Exception)
@@ -142,6 +161,7 @@ async def create_dub(
         }
     )
 
+    r, store, bus, _ss = get_clients()
     try:
         # Check Redis connection first
         await r.ping()
@@ -205,6 +225,7 @@ async def create_dub(
 
 @app.get("/v1/dubs/{job_id}", response_model=DubStatusResponse)
 async def get_status(job_id: str):
+    _r, store, _bus, _ss = get_clients()
     try:
         job = await store.get_job(job_id)
     except KeyError:
@@ -218,16 +239,11 @@ async def get_status(job_id: str):
         error=job.get("error") or None,
     )
 
-@app.get("/v1/dubs/{job_id}/events")
-async def stream_events(job_id: str, request: Request):
-    # Verify job exists
-    try:
-        await store.get_job(job_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail="job not found")
-
+async def _sse_event_response(entity_id: str, request: Request) -> StreamingResponse:
+    """Shared replayable SSE stream over an entity's Redis event stream."""
     async def event_gen():
-        stream_key = events_stream_key(job_id)
+        r, _store, _bus, _ss = get_clients()
+        stream_key = events_stream_key(entity_id)
         last_event_id = request.headers.get("Last-Event-ID")
 
         # Send initial connection status
@@ -251,6 +267,8 @@ async def stream_events(job_id: str, request: Request):
             last_event_id = "$"
 
         while True:
+            if await request.is_disconnected():
+                break
             messages = await r.xread({stream_key: last_event_id}, count=10, block=10000)
             if not messages:
                 yield "event: heartbeat\ndata: {}\n\n"
@@ -266,8 +284,21 @@ async def stream_events(job_id: str, request: Request):
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
+
+@app.get("/v1/dubs/{job_id}/events")
+async def stream_events(job_id: str, request: Request):
+    _r, store, _bus, _ss = get_clients()
+    # Verify job exists
+    try:
+        await store.get_job(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    return await _sse_event_response(job_id, request)
+
 @app.get("/v1/dubs/{job_id}/result")
 async def get_result(job_id: str):
+    _r, store, _bus, _ss = get_clients()
     try:
         job = await store.get_job(job_id)
     except KeyError:
@@ -281,6 +312,7 @@ async def get_result(job_id: str):
 
 @app.get("/v1/dubs/{job_id}/segments/{segment_index}")
 async def get_segment(job_id: str, segment_index: int):
+    _r, store, _bus, _ss = get_clients()
     try:
         path = await store.get_segment(job_id, segment_index)
     except KeyError:
@@ -294,6 +326,7 @@ async def root():
 @app.get("/health")
 async def health():
     """Health check endpoint with Redis connectivity check."""
+    r, _store, _bus, _ss = get_clients()
     try:
         # Quick Redis ping
         await r.ping()
@@ -323,3 +356,144 @@ async def get_metrics():
 @app.get("/metrics")
 async def prometheus_metrics():
     return Response(content=get_prometheus_metrics(), media_type=CONTENT_TYPE_LATEST)
+
+
+# ---------------------------------------------------------------------------
+# Streaming voice-over pipeline (WebSocket ingest + stage streams)
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/streams", response_model=CreateStreamResponse)
+async def create_stream(
+    src_lang: str = Form("en", description="Source language code"),
+    tgt_lang: str = Form("ru", description="Target language code"),
+    voice: str = Form("Tatyana", description="Voice identifier"),
+):
+    """Create a streaming session. Audio is then sent over the WebSocket."""
+    session_id = uuid.uuid4().hex
+    r, _store, bus, stream_store = get_clients()
+    try:
+        await r.ping()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Redis connection failed: {str(e)}")
+
+    await stream_store.create_session(session_id, {
+        "src_lang": src_lang,
+        "tgt_lang": tgt_lang,
+        "voice": voice,
+    })
+    await bus.publish(session_id, "status", {"status": "open"})
+    logger.info(
+        "Streaming session created",
+        extra={"job_id": session_id, "src_lang": src_lang, "tgt_lang": tgt_lang, "operation": "create_stream"},
+    )
+    return CreateStreamResponse(session_id=session_id)
+
+
+@app.websocket("/v1/streams/{session_id}/audio")
+async def stream_audio(ws: WebSocket, session_id: str):
+    """
+    Ingest live audio for a streaming session.
+
+    Binary frames: raw 16 kHz s16le mono PCM chunks.
+    Text frames (JSON control): {"type": "finalize"} ends the input;
+    {"type": "ping"} is answered with {"type": "pong"}.
+    Disconnecting without finalize is treated as end of input.
+    """
+    await ws.accept()
+    r, _store, _bus, stream_store = get_clients()
+    try:
+        await stream_store.get_session(session_id)
+    except KeyError:
+        await ws.close(code=4404)
+        return
+
+    stream_key = chunks_stream_key(session_id)
+    finalized = False
+    try:
+        while True:
+            message = await ws.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            audio = message.get("bytes")
+            if audio:
+                await r.xadd(stream_key, {"audio": audio}, maxlen=CHUNK_STREAM_MAXLEN, approximate=True)
+                continue
+            text = message.get("text")
+            if text:
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                msg_type = data.get("type")
+                if msg_type == "finalize":
+                    await r.xadd(stream_key, {"control": "finalize"})
+                    finalized = True
+                    await ws.send_text(json.dumps({"type": "finalized"}))
+                elif msg_type == "ping":
+                    await ws.send_text(json.dumps({"type": "pong"}))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if not finalized:
+            try:
+                await r.xadd(stream_key, {"control": "finalize"})
+            except Exception:
+                pass
+
+
+@app.get("/v1/streams/{session_id}", response_model=StreamStatusResponse)
+async def get_stream_status(session_id: str):
+    _r, _store, _bus, stream_store = get_clients()
+    try:
+        session = await stream_store.get_session(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    return StreamStatusResponse(
+        session_id=session["session_id"],
+        status=session["status"],
+        src_lang=session["src_lang"],
+        tgt_lang=session["tgt_lang"],
+        voice=session["voice"],
+        finalized=session.get("finalized") == "1",
+        total_segments=int(session.get("total_segments", "0")),
+        done_segments=int(session.get("done_segments", "0")),
+        created_at=float(session.get("created_at", "0")),
+        updated_at=float(session.get("updated_at", "0")),
+        error=session.get("error") or None,
+    )
+
+
+@app.get("/v1/streams/{session_id}/events")
+async def stream_session_events(session_id: str, request: Request):
+    _r, _store, _bus, stream_store = get_clients()
+    try:
+        await stream_store.get_session(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    return await _sse_event_response(session_id, request)
+
+
+@app.get("/v1/streams/{session_id}/result")
+async def get_stream_result(session_id: str):
+    _r, _store, _bus, stream_store = get_clients()
+    try:
+        session = await stream_store.get_session(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    if session["status"] != "done" or not session.get("output_path"):
+        raise HTTPException(status_code=409, detail="result not ready")
+
+    return FileResponse(session["output_path"], media_type="audio/wav", filename=os.path.basename(session["output_path"]))
+
+
+@app.get("/v1/streams/{session_id}/segments/{segment_index}")
+async def get_stream_segment(session_id: str, segment_index: int):
+    _r, store, _bus, _ss = get_clients()
+    try:
+        path = await store.get_segment(session_id, segment_index)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="segment not found")
+    return FileResponse(path, media_type="audio/wav", filename=os.path.basename(path))
