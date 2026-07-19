@@ -1,0 +1,160 @@
+# Phase 5 packaging: full streaming pipeline on a single 4-core host, no GPU.
+# redis + api + segmenter + per-stage dispatchers + per-stage gRPC worker
+# replicas. `cpus:` limits sum to 4.0 across all services.
+#
+# Usage:
+#   docker compose -f docker-compose.full.yml up --build
+#   python tests/load_streaming.py --sessions 8 --wav <16k mono wav>
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  api:
+    build: .
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      USE_AWS: "0"
+    ports:
+      - "8000:8000"
+    volumes:
+      - stream-data:/srv/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+
+  segmenter:
+    build: .
+    command: ["python", "-m", "app.segmenter"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - stream-data:/srv/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+
+  worker-asr:
+    build: .
+    command: ["python", "-m", "app.grpc_servers.serve", "--stage", "asr", "--port", "50051"]
+    environment:
+      USE_AWS: "0"
+      METRICS_PORT: "9121"
+      GRPC_SERVER_THREADS: "4"
+    ports:
+      - "9121:9121"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+
+  worker-mt:
+    build: .
+    command: ["python", "-m", "app.grpc_servers.serve", "--stage", "mt", "--port", "50052"]
+    environment:
+      USE_AWS: "0"
+      METRICS_PORT: "9122"
+      GRPC_SERVER_THREADS: "4"
+    ports:
+      - "9122:9122"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+
+  worker-tts:
+    build: .
+    command: ["python", "-m", "app.grpc_servers.serve", "--stage", "tts", "--port", "50053"]
+    environment:
+      USE_AWS: "0"
+      TTS_PROVIDER: "aws"
+      METRICS_PORT: "9123"
+      GRPC_SERVER_THREADS: "4"
+    ports:
+      - "9123:9123"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+
+  dispatcher-asr:
+    build: .
+    command: ["python", "-m", "app.dispatcher", "--stage", "asr"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      ASR_WORKER_ADDRS: worker-asr:50051
+      METRICS_PORT: "9110"
+    ports:
+      - "9110:9110"
+    volumes:
+      - stream-data:/srv/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+
+  dispatcher-mt:
+    build: .
+    command: ["python", "-m", "app.dispatcher", "--stage", "mt"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MT_WORKER_ADDRS: worker-mt:50052
+      METRICS_PORT: "9111"
+    ports:
+      - "9111:9111"
+    volumes:
+      - stream-data:/srv/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+
+  dispatcher-tts:
+    build: .
+    command: ["python", "-m", "app.dispatcher", "--stage", "tts"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      TTS_WORKER_ADDRS: worker-tts:50053
+      METRICS_PORT: "9112"
+    ports:
+      - "9112:9112"
+    volumes:
+      - stream-data:/srv/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+
+volumes:
+  redis-data:
+  stream-data:
