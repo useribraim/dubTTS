@@ -162,7 +162,17 @@ async def serve(stage: str, port: int, stop_event: asyncio.Event | None = None) 
     add_fn(servicer_cls(), server)
     server.add_insecure_port(f"[::]:{port}")
     await server.start()
-    logger.info("gRPC worker started", extra={"stage": stage, "port": port, "operation": "grpc_worker_start"})
+
+    metrics_port = int(os.getenv("METRICS_PORT", "0") or 0)
+    if metrics_port:
+        from prometheus_client import start_http_server
+
+        start_http_server(metrics_port)
+
+    logger.info(
+        "gRPC worker started",
+        extra={"stage": stage, "port": port, "metrics_port": metrics_port or None, "operation": "grpc_worker_start"},
+    )
     if stop_event is None:
         await server.wait_for_termination()
     else:

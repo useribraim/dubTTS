@@ -237,9 +237,16 @@ async def run_dispatcher(stage: str, stop_event: Optional[asyncio.Event] = None)
     pool = _pool_for(stage)
     r = redis.from_url(REDIS_URL, decode_responses=False)
     ctx = StageContext(r, stage)
+
+    metrics_port = int(os.getenv("METRICS_PORT", "0") or 0)
+    if metrics_port:
+        from prometheus_client import start_http_server
+
+        start_http_server(metrics_port)
+
     logger.info(
         "Dispatcher starting",
-        extra={"stage": stage, "workers": pool.addrs, "operation": "dispatcher_start"},
+        extra={"stage": stage, "workers": pool.addrs, "metrics_port": metrics_port or None, "operation": "dispatcher_start"},
     )
     await run_stage_loop(
         stage,

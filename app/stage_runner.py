@@ -34,6 +34,7 @@ from app.metrics import (
     record_stage_recovered,
     record_stage_retry,
     record_stage_success,
+    set_stage_backlog,
 )
 from app.redis_backend import REDIS_URL, RedisEventBus, RedisJobStore
 from app.streaming import (
@@ -321,6 +322,21 @@ STAGE_HANDLERS: Dict[str, Callable[[StageContext, Dict[str, str]], Awaitable[Dic
 NEXT_STAGE = {"asr": "mt", "mt": "tts", "tts": None}
 
 
+async def _update_backlog_gauge(r: redis.Redis, stream: str, group: str, stage: str) -> None:
+    """Refresh the Prometheus backlog gauge (pending + lag) for a stage."""
+    try:
+        groups = await r.xinfo_groups(stream)
+        entry = next((g for g in groups if g.get("name") == group), None)
+        if entry is None:
+            set_stage_backlog(stage, 0)
+            return
+        pending = int(entry.get("pending", 0))
+        lag = entry.get("lag")
+        set_stage_backlog(stage, pending + (int(lag) if lag is not None else 0))
+    except Exception:
+        pass
+
+
 async def run_stage_loop(
     stage: str,
     handler: Callable[["StageContext", Dict[str, str]], Awaitable[Dict[str, str]]],
@@ -359,6 +375,7 @@ async def run_stage_loop(
                 await asyncio.sleep(1)
                 continue
             if not messages:
+                await _update_backlog_gauge(r, stream, group, stage)
                 continue
             _s, entries = messages[0]
             entry = entries[0]

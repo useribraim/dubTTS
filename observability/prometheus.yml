@@ -11,3 +11,19 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["host.docker.internal:9108"]
+
+  - job_name: dub_dispatchers
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "host.docker.internal:9110"  # asr dispatcher
+          - "host.docker.internal:9111"  # mt dispatcher
+          - "host.docker.internal:9112"  # tts dispatcher
+
+  - job_name: dub_grpc_workers
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "host.docker.internal:9121"  # asr worker
+          - "host.docker.internal:9122"  # mt worker
+          - "host.docker.internal:9123"  # tts worker

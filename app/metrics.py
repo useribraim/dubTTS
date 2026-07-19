@@ -35,6 +35,16 @@ TTFS_MS = Histogram(
     "Time to first segment in ms",
     buckets=(500, 1000, 2000, 5000, 10000, 20000, 40000),
 )
+TTFA_MS = Histogram(
+    "dub_time_to_first_audio_ms",
+    "Time from first speech onset to first translated audio in ms (streaming)",
+    buckets=(250, 500, 1000, 2000, 3000, 5000, 8000, 12000, 20000),
+)
+STREAM_E2E_MS = Histogram(
+    "dub_stream_end_to_end_ms",
+    "Streaming session end-to-end latency in ms (create to stitched result)",
+    buckets=(1000, 2000, 5000, 10000, 20000, 40000, 60000, 120000, 300000),
+)
 STAGE_LATENCY_MS = Histogram(
     "dub_stage_latency_ms",
     "Per-stage latency in ms",
@@ -43,6 +53,7 @@ STAGE_LATENCY_MS = Histogram(
 )
 QUEUE_DEPTH = Gauge("dub_queue_depth", "Jobs pending in queue")
 ACTIVE_JOBS = Gauge("dub_active_jobs", "Jobs currently processing")
+STAGE_BACKLOG = Gauge("dub_stage_backlog", "Pending + lag entries for a stage stream", ["stage"])
 RETRY_COUNTER = Counter("dub_job_retries_total", "Total job retries")
 FAILURE_COUNTER = Counter("dub_job_failures_total", "Total job failures")
 CACHE_HIT_COUNTER = Counter("dub_cache_hits_total", "Cache hits", ["operation"])
@@ -295,6 +306,10 @@ async def record_job_timing(job_id: str, timing_type: str, timestamp_ms: float) 
             JOB_LATENCY_MS.observe(timestamp_ms)
         elif timing_type == "time_to_first_segment":
             TTFS_MS.observe(timestamp_ms)
+        elif timing_type == "time_to_first_audio":
+            TTFA_MS.observe(timestamp_ms)
+        elif timing_type == "stream_end_to_end":
+            STREAM_E2E_MS.observe(timestamp_ms)
     except Exception:
         pass
 
@@ -302,6 +317,13 @@ async def record_job_timing(job_id: str, timing_type: str, timestamp_ms: float) 
 def set_queue_depth(depth: int) -> None:
     try:
         QUEUE_DEPTH.set(depth)
+    except Exception:
+        pass
+
+
+def set_stage_backlog(stage: str, backlog: int) -> None:
+    try:
+        STAGE_BACKLOG.labels(stage=stage).set(backlog)
     except Exception:
         pass
 
@@ -425,10 +447,56 @@ async def get_job_timing_metrics() -> Dict[str, Dict[str, float]]:
         return {}
 
 
+async def get_queue_delay_share(stages=("asr", "mt", "tts")) -> Dict:
+    """
+    Queue delay (enqueue -> claim) per stage and its share of the
+    per-segment onset-to-audio latency.
+    """
+    latency_metrics = await get_latency_metrics()
+    per_stage: Dict[str, float] = {}
+    total_queue_p50 = 0.0
+    for stage in stages:
+        p50 = latency_metrics.get(f"queue_delay_{stage}", {}).get("p50", 0.0)
+        per_stage[stage] = round(p50, 2)
+        total_queue_p50 += p50
+    segment_p50 = latency_metrics.get("segment_onset_to_audio", {}).get("p50", 0.0)
+    share = (total_queue_p50 / segment_p50) if segment_p50 > 0 else None
+    return {
+        "per_stage_queue_delay_p50_ms": per_stage,
+        "total_queue_delay_p50_ms": round(total_queue_p50, 2),
+        "segment_onset_to_audio_p50_ms": round(segment_p50, 2),
+        "queue_delay_share_of_segment_latency": round(share, 4) if share is not None else None,
+    }
+
+
+async def get_stage_backlog(stages=("asr", "mt", "tts")) -> Dict[str, int]:
+    """Live consumer backlog (pending + lag) per stage stream."""
+    from app.streaming import SEG_GROUPS, SEG_STREAMS
+
+    try:
+        r = _get_metrics_redis()
+    except Exception:
+        return {}
+    backlog: Dict[str, int] = {}
+    for stage in stages:
+        try:
+            groups = await r.xinfo_groups(SEG_STREAMS[stage])
+            group = next((g for g in groups if g.get("name") == SEG_GROUPS[stage]), None)
+            if group is None:
+                backlog[stage] = 0
+                continue
+            pending = int(group.get("pending", 0))
+            lag = group.get("lag")
+            backlog[stage] = pending + (int(lag) if lag is not None else 0)
+        except Exception:
+            backlog[stage] = 0
+    return backlog
+
+
 async def get_performance_report() -> Dict:
     """
     Generate a comprehensive performance report with before/after comparisons.
-    
+
     Returns:
         Dictionary with latency metrics, cache stats, and improvement calculations
     """
@@ -436,6 +504,8 @@ async def get_performance_report() -> Dict:
     cache_stats = await get_cache_stats()
     job_timing_metrics = await get_job_timing_metrics()
     reliability_stats = await get_reliability_stats()
+    queue_delay = await get_queue_delay_share()
+    stage_backlog = await get_stage_backlog()
     
     # Calculate cache improvement using ACTUAL measured latencies
     cache_improvement = {}
@@ -513,5 +583,7 @@ async def get_performance_report() -> Dict:
         "job_timing_metrics": job_timing_metrics,
         "incremental_improvement": incremental_improvement,
         "reliability": reliability_stats,
+        "queue_delay": queue_delay,
+        "stage_backlog": stage_backlog,
         "timestamp": datetime.utcnow().isoformat(),
     }
